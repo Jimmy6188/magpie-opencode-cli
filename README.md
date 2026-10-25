@@ -26,10 +26,20 @@ CLI 未安装时，登录会失败并提示安装命令。
 
 ## 安装
 
+从 git 仓库（公开仓库，目标机器的 git 无需凭据）：
+
 ```sh
-magpie plugin add D:\Vibe coding\magpie-opencode-cli
+magpie plugin add github:Jimmy6188/magpie-opencode-cli
 magpie plugin login opencode-cli
 magpie providers
+```
+
+钉某个版本用 `#`：`magpie plugin add github:Jimmy6188/magpie-opencode-cli#v0.1.0`。
+
+本地开发则直接给文件夹路径，就地加载当前内容：
+
+```sh
+magpie plugin add /path/to/magpie-opencode-cli
 ```
 
 登录方式是「本机 OpenCode CLI」，**无需任何密钥**——CLI 用它自己的本地身份（匿名，或你自己登录过的账号）。
