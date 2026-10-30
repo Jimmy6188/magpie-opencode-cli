@@ -9,8 +9,9 @@
 // OpenAI chat completions and the CLI's JSON event stream.
 
 import { randomUUID } from "node:crypto";
-import { findOpencode, listModels, runPrompt } from "./cli.mjs";
+import { findOpencode, listModels, runPrompt, supportsStdin } from "./cli.mjs";
 import {
+  MAX_ARG,
   MAX_PROMPT,
   SSE_DONE,
   chunk,
@@ -151,6 +152,13 @@ async function server() {
                 `The conversation is too long for one OpenCode CLI call (${prompt.length} characters, limit ${MAX_PROMPT}). Start a new conversation.`,
               );
             }
+            if (prompt.length > MAX_ARG && !(await supportsStdin(bin))) {
+              // 1.x cannot take the prompt on stdin, so argv stays the ceiling.
+              return jsonError(
+                400,
+                `The conversation is too long for one OpenCode CLI call (${prompt.length} characters, limit ${MAX_ARG}). Start a new conversation.`,
+              );
+            }
 
             const id = `chatcmpl-${randomUUID().replace(/-/g, "")}`;
             const created = Math.floor(Date.now() / 1000);
@@ -204,10 +212,16 @@ async function server() {
                 const abort = () => stop.abort();
                 caller?.addEventListener("abort", abort, { once: true });
                 (async () => {
+                  // OpenCode CLI 1.x ends a step with `step_finish`; 2.x emits
+                  // only `step_start` and `text`, so the stop chunk has to be
+                  // sent when the event stream ends instead.
+                  let finished = false;
+                  let failed = false;
                   try {
                     for await (const event of runPrompt(bin, model, prompt, stop.signal)) {
                       const error = eventError(event);
                       if (error) {
+                        failed = true;
                         send({ error: { message: error, type: "upstream_error" } });
                         break;
                       }
@@ -217,9 +231,11 @@ async function server() {
                         const usage = completionUsage(event.part);
                         if (usage) send(usageChunk(id, model, created, usage));
                         send(chunk(id, model, created, {}, "stop"));
+                        finished = true;
                         break;
                       }
                     }
+                    if (!finished && !failed) send(chunk(id, model, created, {}, "stop"));
                     controller.enqueue(encoder.encode(SSE_DONE));
                   } catch (error) {
                     const message = error?.message ?? String(error);

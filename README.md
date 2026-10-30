@@ -17,12 +17,21 @@ OpenCode 的免费额度只对**官方客户端**开放。同一个模型、同�
 
 ## 依赖
 
-- 已安装 **OpenCode CLI**（`npm i -g opencode-ai`，或 `~/.opencode/bin/opencode`）
+- 已安装 **OpenCode CLI**，1.x（`npm i -g opencode-ai`）或 2.x（`npm i -g @opencode/cli`）都可以；`~/.opencode/bin/opencode` 也行
 - magpie（自带 Bun 插件宿主，无需另装 Node）
 
-插件按以下顺序查找 CLI：`PATH` → `OPENCODE_BIN` / `BUDDY_OPENCODE_PATH` 环境变量 → `~/.opencode/bin/opencode.exe` → npm 全局 `node_modules/opencode-ai/bin/opencode.exe`。npm 留下的 `.cmd` 垫片会被跟踪到它指向的真实 `.exe`。
+插件按以下顺序查找 CLI：`PATH` → `OPENCODE_BIN` / `BUDDY_OPENCODE_PATH` 环境变量 → `~/.opencode/bin/opencode.exe` → npm 全局 `node_modules/opencode-ai/bin/opencode.exe` → npm 全局 `opencode.cmd`。npm 留下的 `.cmd` 垫片会被跟踪到它指向的真实 `.exe`。
 
 CLI 未安装时，登录会失败并提示安装命令。
+
+两个大版本在插件里的差异：
+
+| | 1.x | 2.x |
+|---|---|---|
+| 模型列表 | `models --verbose` 带完整元数据 | 只有 `models`，仅 id，无上下文/费用字段 |
+| 事件流 | `step_start` / `text` / `step_finish` | 只有 `step_start` / `text` |
+| token 用量 | `step_finish` 里带 | 不提供，用量记为 0 |
+| 长对话 | 只能走命令行参数 | 走 stdin，无 32,767 字符限制 |
 
 ## 安装
 
@@ -59,11 +68,12 @@ nemotron-3-ultra-free           nemotron-3.5-lightning-free   nemotron-3.5-super
 ## 已知限制
 
 1. **只支持对话，不支持工具调用**。插件的模型声明 `toolcall: false`，请求里的 `tools` 会被忽略。工具调用需要额外一套 JSON envelope 协议，尚未实现。
-2. **对话长度受 Windows 命令行上限约束**（32,767 字符）。超过 24,000 字符会返回明确错误而不是诡异的进程错误。长对话需要改用 `opencode serve` 方案。
+2. **对话长度**：1.x 受 Windows 命令行上限约束（32,767 字符），超过 24,000 字符会返回明确错误；2.x 把 prompt 走 stdin，上限放宽到 200,000 字符（约为免费模型 128k 上下文的一半）。
 3. **无会话连续性**：每一轮都把完整历史序列化进 prompt，token 开销高于原生 session。
 4. **每次请求多 1–2 秒**：要为该请求启动一个 CLI 进程。
 5. **并发上限 2**（`magpie.maxConcurrency`），每个请求一个进程。
-6. **上游风险**：OpenCode 维护者明言该身份门禁 "may change at any time"，CLI 通道哪天被收不意外。
+6. **2.x 没有 token 用量**：`step_finish` 事件被移除，magpie 里该渠道的消耗显示为 0。
+7. **上游风险**：OpenCode 维护者明言该身份门禁 "may change at any time"，CLI 通道哪天被收不意外。
 
 ## 工作原理
 

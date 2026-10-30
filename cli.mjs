@@ -8,6 +8,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { MAX_ARG } from "./protocol.mjs";
+
 const ID_LINE = /^[a-z0-9][\w.-]*\/[\w][\w.-]*$/;
 
 // Where an OpenCode install is looked for. npm's global prefix is the usual
@@ -99,6 +101,20 @@ export async function version(bin) {
   return out.trim().replace(/^opencode\s+v?/i, "");
 }
 
+// 2.x reads the prompt from stdin when no message argument is given; 1.x does
+// not, so a prompt too long for argv stays a readable error there.
+let majorCache;
+export async function supportsStdin(bin) {
+  if (majorCache === undefined) {
+    try {
+      majorCache = Number.parseInt(String(await version(bin)).split(".")[0], 10);
+    } catch {
+      majorCache = Number.NaN;
+    }
+  }
+  return Number.isFinite(majorCache) && majorCache >= 2;
+}
+
 // `opencode models --verbose` prints one `provider/id` line followed by that
 // model's JSON, for every model the CLI can use.
 export function parseVerbose(text) {
@@ -139,9 +155,43 @@ export function isFreeModel(model) {
   );
 }
 
+// OpenCode CLI 2.x dropped `models --verbose`: it prints one `provider/id` line
+// per model and nothing else. The metadata (limits, cost) that 1.x gave is
+// gone, so entries are rebuilt with the free-tier defaults the plugin already
+// assumed for missing fields.
+export function parsePlain(text) {
+  const models = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!ID_LINE.test(trimmed)) continue;
+    const slash = trimmed.indexOf("/");
+    const providerID = trimmed.slice(0, slash);
+    if (providerID !== "opencode") continue;
+    const id = trimmed.slice(slash + 1);
+    if (!id || id.includes("/")) continue;
+    models.push({
+      key: trimmed,
+      id,
+      name: id,
+      providerID,
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    });
+  }
+  return models;
+}
+
 export async function listModels(bin) {
-  const out = await run(bin, ["models", "--verbose"], { timeout: 60_000 });
-  return parseVerbose(out).filter(isFreeModel);
+  // 1.x: `models --verbose` prints each `provider/id` followed by its JSON.
+  try {
+    const out = await run(bin, ["models", "--verbose"], { timeout: 60_000 });
+    const models = parseVerbose(out).filter(isFreeModel);
+    if (models.length) return models;
+  } catch {
+    // 2.x rejects the flag outright; fall through to the plain listing.
+  }
+  // 2.x: `models` alone lists every `provider/id`, one per line.
+  const out = await run(bin, ["models"], { timeout: 60_000 });
+  return parsePlain(out).filter(isFreeModel);
 }
 
 // A directory of its own, so the CLI does not treat whatever directory the
@@ -152,13 +202,26 @@ export function workDir(env = process.env) {
   return dir;
 }
 
-// Runs one prompt and yields the CLI's JSON events as they arrive.
+// Runs one prompt and yields the CLI's JSON events as they arrive. Prompts
+// that fit on the command line go there (1.x behaviour); longer ones travel
+// over stdin, which 2.x reads when no message argument is given.
 export async function* runPrompt(bin, model, prompt, signal) {
+  const args = ["run", "--format", "json", "-m", `opencode/${model}`];
+  const useStdin = prompt.length > MAX_ARG;
   const child = spawn(
     bin,
-    ["run", "--format", "json", "-m", `opencode/${model}`, prompt],
-    { cwd: workDir(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+    useStdin ? args : [...args, prompt],
+    {
+      cwd: workDir(),
+      windowsHide: true,
+      stdio: useStdin ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+    },
   );
+  if (useStdin) {
+    // The CLI can exit before reading everything; that surfaces as EPIPE.
+    child.stdin.on("error", () => {});
+    child.stdin.end(prompt, "utf8");
+  }
   let stderr = "";
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const failures = [];

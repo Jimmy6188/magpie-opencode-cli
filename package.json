@@ -1,6 +1,6 @@
 {
   "name": "magpie-opencode-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "OpenCode free models through the local OpenCode CLI, for magpie",
   "type": "module",

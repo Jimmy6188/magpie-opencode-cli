@@ -10,9 +10,14 @@ const ROLE_LABEL = {
 };
 
 // Windows builds one command line for the child process and caps it at
-// 32,767 characters. Stay well under it so a long conversation fails with
-// a readable error instead of a spawn failure.
-export const MAX_PROMPT = 24_000;
+// 32,767 characters. A prompt that fits in argv is passed there; anything
+// longer goes to the CLI over stdin, which has no such cap.
+export const MAX_ARG = 24_000;
+
+// The real ceiling once the prompt travels on stdin is the model's context
+// window, not the command line. 200k characters is roughly 100k tokens of
+// Chinese, comfortably inside the 128k-token free models.
+export const MAX_PROMPT = 200_000;
 
 export function messageText(message) {
   const content = message?.content;

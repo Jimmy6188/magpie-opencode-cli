@@ -4,7 +4,7 @@
 
 const mod = await import("./index.mjs");
 const server = await mod.default.server();
-const { findOpencode, listModels, version } = await import("./cli.mjs");
+const { findOpencode, listModels, version, supportsStdin } = await import("./cli.mjs");
 const { toPrompt, MAX_PROMPT } = await import("./protocol.mjs");
 
 const MODEL = "nemotron-3.5-lightning-free";
@@ -23,6 +23,11 @@ check("free models listed", models.length > 0, `${models.length} models`);
 console.log(
   models.map((m) => `    ${m.id}  ctx=${m.limit?.context} out=${m.limit?.output}`).join("\n"),
 );
+
+// 2.x lists model ids without the metadata 1.x's `models --verbose` gave, and
+// reports no token counts at all, so the usage check below only applies to 1.x.
+const cliVersion = await version(bin);
+const onV2 = await supportsStdin(bin);
 
 check("prompt keeps turns", toPrompt([
   { role: "system", content: "terse" },
@@ -51,7 +56,11 @@ check("non-streaming answers", plain.status === 200 && completion.choices?.[0]?.
 const streamed = await post({ model: MODEL, messages, stream: true });
 const text = await new Response(streamed.body).text();
 check("streaming sends [DONE]", streamed.status === 200 && text.includes("data: [DONE]"));
-check("streaming sends usage", text.includes('"usage"'));
+if (onV2) {
+  console.log("– streaming sends usage — skipped: OpenCode CLI 2.x sends no step_finish, so no token counts");
+} else {
+  check("streaming sends usage", text.includes('"usage"'));
+}
 check("streaming sends finish_reason", text.includes('"finish_reason":"stop"'));
 
 const geo = await post({ model: "beam-free", messages });
@@ -66,5 +75,5 @@ check("unknown model lists the free ones", unknown.status === 404 && unknownBody
 const empty = await post({ model: MODEL, messages: [] });
 check("empty messages rejected", empty.status === 400);
 
-console.log(`\n${failures ? `${failures} check(s) failed` : "all checks passed"} (CLI ${await version(bin)}, MAX_PROMPT ${MAX_PROMPT})`);
+console.log(`\n${failures ? `${failures} check(s) failed` : "all checks passed"} (CLI ${cliVersion}, MAX_PROMPT ${MAX_PROMPT})`);
 process.exit(failures ? 1 : 0);
