@@ -16,7 +16,7 @@ import {
   SSE_DONE,
   chunk,
   completionUsage,
-  eventError,
+  eventFailure,
   eventText,
   sse,
   toPrompt,
@@ -32,11 +32,50 @@ const bin = findOpencode();
 // What the last successful listing gave, so a failed one keeps the models shown.
 let known = {};
 
-function jsonError(status, message, type = "invalid_request_error") {
+function jsonError(status, message, type = "invalid_request_error", headers = {}) {
   return new Response(JSON.stringify({ error: { message, type } }), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
+}
+
+const QUOTA = /free.?limit|free.?usage|quota/i;
+
+function resetText(retryAfterMs) {
+  const at = new Date(Date.now() + retryAfterMs);
+  const pad = (value) => String(value).padStart(2, "0");
+  const clock = `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+  const hours = (retryAfterMs / 3_600_000).toFixed(1);
+  return `${clock}（约 ${hours} 小时后）`;
+}
+
+// A spent free allowance is rate limiting, not a broken call: OpenCode answers
+// 429 FreeUsageLimitError with the delay it will accept requests again after.
+// Passing that through as 429 plus Retry-After is what lets magpie cool the
+// provider down and fall back to the next one in the group, instead of
+// reporting the same failure on every retry.
+function describeFailure(failure) {
+  const retryAfterMs = Number(failure?.retryAfterMs);
+  const hasRetry = Number.isFinite(retryAfterMs) && retryAfterMs > 0;
+  const quota = Boolean(failure?.quota) || QUOTA.test(String(failure?.message ?? ""));
+  const upstream = Number(failure?.status);
+  const status = quota ? 429 : Number.isFinite(upstream) && upstream >= 400 ? upstream : 502;
+  let message = failure?.message || "OpenCode CLI reported an error";
+  if (quota && hasRetry) message += ` Free quota resets at ${resetText(retryAfterMs)}.`;
+  return {
+    status,
+    message,
+    type: status === 429 ? "rate_limit_error" : "upstream_error",
+    retryAfterMs: quota && hasRetry ? retryAfterMs : undefined,
+  };
+}
+
+function failureResponse(failure) {
+  const described = describeFailure(failure);
+  const headers = described.retryAfterMs
+    ? { "retry-after": String(Math.max(1, Math.ceil(described.retryAfterMs / 1000))) }
+    : {};
+  return jsonError(described.status, described.message, described.type, headers);
 }
 
 function toModel(entry) {
@@ -62,8 +101,8 @@ function toModel(entry) {
   };
 }
 
-async function refresh() {
-  const models = await listModels(bin);
+async function refresh(list) {
+  const models = await list(bin);
   const next = {};
   for (const entry of models) next[entry.id] = toModel(entry);
   return next;
@@ -71,8 +110,11 @@ async function refresh() {
 
 // magpie's plugin host calls this once per start; the object it returns is the
 // plugin. (An object exported in its place is rejected: "exports no OpenCode
-// plugin function".)
-async function server() {
+// plugin function".) The overrides exist so the offline checks can drive the
+// request path without spending a free allowance.
+async function server(options = {}) {
+  const run = options.run ?? runPrompt;
+  const list = options.list ?? listModels;
   return {
     async config(cfg) {
       cfg.provider ??= {};
@@ -128,7 +170,7 @@ async function server() {
               // A gateway process that has not listed models yet arrives here
               // with nothing known: ask the CLI once rather than fail the call.
               try {
-                known = await refresh();
+                known = await refresh(list);
               } catch {
                 // Left empty; the 404 below says which models there are.
               }
@@ -170,10 +212,10 @@ async function server() {
               let usage;
               let failure;
               try {
-                for await (const event of runPrompt(bin, model, prompt, caller)) {
-                  text += eventText(event);
-                  const error = eventError(event);
-                  if (error) failure = error;
+                for await (const event of run(bin, model, prompt, caller)) {
+                  const reported = eventFailure(event);
+                  if (reported) failure = reported;
+                  else text += eventText(event);
                   if (event?.type === "step_finish") {
                     usage = completionUsage(event.part);
                     break;
@@ -182,9 +224,9 @@ async function server() {
               } catch (error) {
                 // The CLI's own error event, already read off stdout, says more
                 // than "exited 1": keep the first one.
-                if (!failure) failure = error?.message ?? String(error);
+                if (!failure) failure = { message: error?.message ?? String(error) };
               }
-              if (failure) return jsonError(502, failure, "upstream_error");
+              if (failure) return failureResponse(failure);
               return new Response(
                 JSON.stringify({
                   id,
@@ -205,48 +247,92 @@ async function server() {
             }
 
             const encoder = new TextEncoder();
+            const stop = new AbortController();
+            const abort = () => stop.abort();
+            caller?.addEventListener("abort", abort, { once: true });
+
+            // A rejected call can be the very first thing the CLI prints. Read
+            // that first event before the response is committed: a streaming
+            // request that fails on quota has to answer 429, otherwise the
+            // caller gets a 200 whose body carries the error and cannot retry
+            // or fall back on the status at all.
+            const iteration = run(bin, model, prompt, stop.signal)[Symbol.asyncIterator]();
+            let head;
+            try {
+              head = await iteration.next();
+            } catch (error) {
+              caller?.removeEventListener("abort", abort);
+              stop.abort();
+              return jsonError(502, error?.message ?? String(error), "upstream_error");
+            }
+            const headFailure = head.done ? null : eventFailure(head.value);
+            if (headFailure) {
+              caller?.removeEventListener("abort", abort);
+              stop.abort();
+              try {
+                await iteration.return?.();
+              } catch {
+                // The CLI was already stopped by the abort above.
+              }
+              return failureResponse(headFailure);
+            }
+
             const stream = new ReadableStream({
               start(controller) {
                 const send = (event) => controller.enqueue(encoder.encode(sse(event)));
-                const stop = new AbortController();
-                const abort = () => stop.abort();
-                caller?.addEventListener("abort", abort, { once: true });
+                // OpenCode CLI 1.x ends a step with `step_finish`; 2.x emits
+                // only `step_start` and `text`, so the stop chunk has to be
+                // sent when the event stream ends instead. Returns true once
+                // the answer is over, either way.
+                let finished = false;
+                let failed = false;
+                const emit = (event) => {
+                  const failure = eventFailure(event);
+                  if (failure) {
+                    failed = true;
+                    send({
+                      error: { message: describeFailure(failure).message, type: "upstream_error" },
+                    });
+                    return true;
+                  }
+                  const text = eventText(event);
+                  if (text) send(chunk(id, model, created, { content: text }));
+                  if (event?.type === "step_finish") {
+                    const usage = completionUsage(event.part);
+                    if (usage) send(usageChunk(id, model, created, usage));
+                    send(chunk(id, model, created, {}, "stop"));
+                    finished = true;
+                    return true;
+                  }
+                  return false;
+                };
                 (async () => {
-                  // OpenCode CLI 1.x ends a step with `step_finish`; 2.x emits
-                  // only `step_start` and `text`, so the stop chunk has to be
-                  // sent when the event stream ends instead.
-                  let finished = false;
-                  let failed = false;
                   try {
-                    for await (const event of runPrompt(bin, model, prompt, stop.signal)) {
-                      const error = eventError(event);
-                      if (error) {
-                        failed = true;
-                        send({ error: { message: error, type: "upstream_error" } });
-                        break;
-                      }
-                      const text = eventText(event);
-                      if (text) send(chunk(id, model, created, { content: text }));
-                      if (event?.type === "step_finish") {
-                        const usage = completionUsage(event.part);
-                        if (usage) send(usageChunk(id, model, created, usage));
-                        send(chunk(id, model, created, {}, "stop"));
-                        finished = true;
-                        break;
-                      }
+                    if (!head.done) emit(head.value);
+                    while (!finished && !failed) {
+                      const next = await iteration.next();
+                      if (next.done) break;
+                      if (emit(next.value)) break;
                     }
                     if (!finished && !failed) send(chunk(id, model, created, {}, "stop"));
                     controller.enqueue(encoder.encode(SSE_DONE));
                   } catch (error) {
-                    const message = error?.message ?? String(error);
-                    try {
-                      send({ error: { message, type: "upstream_error" } });
-                      controller.enqueue(encoder.encode(SSE_DONE));
-                    } catch {
-                      // The caller already went away.
+                    if (!caller?.aborted) {
+                      const message = error?.message ?? String(error);
+                      try {
+                        send({ error: { message, type: "upstream_error" } });
+                        controller.enqueue(encoder.encode(SSE_DONE));
+                      } catch {
+                        // The caller already went away.
+                      }
                     }
                   } finally {
                     caller?.removeEventListener("abort", abort);
+                    try {
+                      await iteration.return?.();
+                    } catch {
+                      // Nothing left to stop.
+                    }
                     controller.close();
                   }
                 })();
@@ -277,7 +363,7 @@ async function server() {
       async models(provider, { auth } = {}) {
         if (!auth) return provider.models;
         try {
-          known = await refresh();
+          known = await refresh(list);
         } catch (error) {
           // The CLI could not be asked: keep the list already shown, and say
           // why once, since magpie would otherwise show an empty provider.

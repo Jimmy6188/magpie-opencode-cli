@@ -65,6 +65,25 @@ nemotron-3-ultra-free           nemotron-3.5-lightning-free   nemotron-3.5-super
 
 模型 ID 形如 `opencode-cli/nemotron-3.5-lightning-free`，和其他供应商一样可以进 `auto/*` 路由组、配 `fallback`。
 
+## 免费额度用尽时会发生什么
+
+OpenCode 的免费池按本机身份（或 API key）限流；额度用尽时它返回 429
+`FreeUsageLimitError`，并附上接受下次请求的等待时长。插件把这个状态原样往上传：
+
+```
+HTTP 429
+Retry-After: 74808
+{"error":{"message":"Free usage limit reached. … Free quota resets at 2026-11-07 08:49（约 20.8 小时后）.",
+          "type":"rate_limit_error"}}
+```
+
+流式请求也一样：插件会先读 CLI 打印的第一个事件，确认不是错误才提交 SSE 响应。
+这样调用方（magpie 路由组）看到的是真正的 429，可以按 `Retry-After` 冷却该供应商并切到下一个成员，
+而不是拿到一个 HTTP 200、错误藏在响应体里的“成功”请求。
+
+0.1.2 之前的版本对**流式**请求会先回 200 再在流里吐错误，且把额度耗尽当普通 502，
+丢掉状态码和重置时间。
+
 ## 已知限制
 
 1. **只支持对话，不支持工具调用**。插件的模型声明 `toolcall: false`，请求里的 `tools` 会被忽略。工具调用需要额外一套 JSON envelope 协议，尚未实现。
@@ -74,6 +93,7 @@ nemotron-3-ultra-free           nemotron-3.5-lightning-free   nemotron-3.5-super
 5. **并发上限 2**（`magpie.maxConcurrency`），每个请求一个进程。
 6. **2.x 没有 token 用量**：`step_finish` 事件被移除，magpie 里该渠道的消耗显示为 0。
 7. **上游风险**：OpenCode 维护者明言该身份门禁 "may change at any time"，CLI 通道哪天被收不意外。
+8. **免费额度**：免费池按 IP/key 限流，与模型无关——一个模型 429 时其他免费模型同样 429，只能等 `Retry-After` 到期或换网络出口，没有“换模型绕过”。额度本身由上游控制，插件无法恢复。
 
 ## 工作原理
 
@@ -92,9 +112,12 @@ protocol.mjs  事件 → OpenAI SSE chunk / 非流式 completion
 ## 开发
 
 ```sh
-node verify.mjs
+bun selftest.mjs   # 离线：用假 runner 跑错误与流式路径，不需要额度
+node verify.mjs    # 真实：会发起实际请求，需要免费额度可用
 ```
 
 `verify.mjs` 跑本地检查：CLI 定位、免费模型列表、提示词形态、一次非流式请求、一次流式请求（`[DONE]`/usage/`finish_reason`）、地区墙模型的错误信息、未知模型与空 messages 的拒绝。它不属于插件运行所需文件。
 
-要改协议转换就看 `protocol.mjs`，要改 CLI 调用就看 `cli.mjs`，两者的输入输出都被 `verify.mjs` 覆盖。
+`selftest.mjs` 用注入的 runner 覆盖额度错误（流式与非流式都必须先回 429 + `Retry-After`）、2.x/1.x 正常流、流中途失败、旧版错误结构、未知模型与空消息的拒绝，因此额度耗尽时也能验证改动。
+
+要改协议转换就看 `protocol.mjs`，要改 CLI 调用就看 `cli.mjs`，两者的输入输出都被 `verify.mjs` 与 `selftest.mjs` 覆盖。

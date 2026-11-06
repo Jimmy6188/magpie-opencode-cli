@@ -1,11 +1,11 @@
 {
   "name": "magpie-opencode-cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "OpenCode free models through the local OpenCode CLI, for magpie",
   "type": "module",
   "main": "./index.mjs",
-  "files": ["index.mjs", "cli.mjs", "protocol.mjs", "verify.mjs", "README.md"],
+  "files": ["index.mjs", "cli.mjs", "protocol.mjs", "verify.mjs", "selftest.mjs", "README.md"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "provider"],
   "license": "MIT",
   "magpie": {

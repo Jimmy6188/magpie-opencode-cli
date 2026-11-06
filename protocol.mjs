@@ -91,24 +91,53 @@ export function eventText(event) {
   return part.text;
 }
 
-// OpenCode reports a failed call as
-// {"type":"error","error":{"name":"APIError","data":{"message","statusCode","responseBody"}}}
-// where responseBody is the provider's own JSON error.
-export function eventError(event) {
+// A failed call comes back in one of two shapes:
+//
+//   OpenCode CLI 2.x
+//     {"type":"error","error":{"type":"provider.free-limit","message":"…","status":429,
+//      "response":{"body":"{\"error\":{…}}"},"retryAfterMs":75277000}}
+//   OpenCode CLI 1.x
+//     {"type":"error","error":{"name":"APIError","data":{"message","statusCode","responseBody"}}}
+//
+// The status and the retry delay are what let the caller rate-limit the
+// provider instead of treating a spent free allowance as a broken call, so
+// both are read out here rather than folded into a string.
+function decodeBody(body) {
+  if (typeof body !== "string") return null;
+  if (!body.trimStart().startsWith("{")) return null;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
+const QUOTA = /free-limit|free.?usage|quota/i;
+
+export function eventFailure(event) {
   if (event?.type !== "error") return null;
   const error = event.error ?? event.part?.error ?? {};
-  let message = error.data?.message ?? error.message;
-  const body = error.data?.responseBody;
-  if (typeof body === "string" && body.trimStart().startsWith("{")) {
-    try {
-      const parsed = JSON.parse(body);
-      const inner = parsed?.error?.message ?? parsed?.message;
-      if (typeof inner === "string" && inner) message = inner;
-    } catch {
-      // The body is not JSON; the outer message stands.
-    }
-  }
-  if (typeof message !== "string" || !message) message = "OpenCode CLI reported an error";
-  const status = error.data?.statusCode;
-  return typeof status === "number" ? `${message} (HTTP ${status})` : message;
+  const data = error.data ?? {};
+  const body = decodeBody(data.responseBody) ?? decodeBody(error.response?.body);
+  const inner = body?.error?.message ?? body?.message;
+  const message =
+    [inner, data.message, error.message].find((value) => typeof value === "string" && value) ??
+    "OpenCode CLI reported an error";
+  const status = [error.status, data.statusCode, body?.error?.status].find(
+    (value) => typeof value === "number" && value >= 400,
+  );
+  const code = String(error.type ?? error.name ?? body?.error?.type ?? "");
+  const retryAfterMs = [error.retryAfterMs, data.retryAfterMs, body?.retryAfterMs].find(
+    (value) => typeof value === "number" && value > 0,
+  );
+  return { message, status, code, retryAfterMs, quota: QUOTA.test(`${code} ${message}`) };
+}
+
+// Kept for callers that only want the sentence to show a user.
+export function eventError(event) {
+  const failure = eventFailure(event);
+  if (!failure) return null;
+  return typeof failure.status === "number"
+    ? `${failure.message} (HTTP ${failure.status})`
+    : failure.message;
 }
